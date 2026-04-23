@@ -1,0 +1,9 @@
+[project]
+name = "seek"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.15"
+dependencies = [
+    "openai>=2.32.0",
+]
