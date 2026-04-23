@@ -35,7 +35,7 @@ AVAILABLE_FUNCTIONS = {"write_file": write_file}
 messages = []
 print("type '/exit' to quit.\n")
 while True:
-    user_input = input("You:\n").strip()
+    user_input = input("\nYou:\n").strip()
     if user_input == "/exit":
         break
     messages.append({"role": "user", "content": user_input})
