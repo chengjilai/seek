@@ -13,18 +13,6 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError
 import config
 DEEPSEEK_API_KEY=os.getenv("DEEPSEEK_API_KEY")
-# ---------- 官方 Token 及模板 ----------
-BOS = "<｜BOS｜>"
-EOS = "<｜EOS｜>"
-THINK_START = "<think>"
-THINK_END = "</think>"
-DSML = "|DSML|"
-TC_BLOCK = "tool_calls"
-SYS_TMPL = "{content}"
-USER_TMPL = "{content}"
-ASST_TMPL = "{reasoning}{content}{tool_calls}" + EOS
-DSML_TMPL = "<{dsml}{block}>\n{invokes}\n</{dsml}{block}>"
-INVOKE_TMPL = '<{dsml}invoke name="{name}">\n{args}\n</{dsml}invoke>'
 PROMPT_PATTERNS = [
     rb"\$ ", rb"# ", rb">>> ", rb"\.\.\. ",
     rb"\[y/N\]", rb"\[Y/n\]", rb"\(yes/no\)",
@@ -38,33 +26,6 @@ def _sanitize(obj):
     elif obj is None:
         return None
     return obj
-def encode_message(msg: dict) -> str:
-    role = msg.get("role")
-    content = msg.get("content", "") or ""
-    if role == "system":
-        return SYS_TMPL.format(content=content)
-    elif role == "user":
-        return USER_TMPL.format(content=content)
-    elif role == "assistant":
-        reasoning = msg.get("reasoning", "")
-        tc_list = msg.get("tool_calls", [])
-        invokes = []
-        for tc in tc_list:
-            func_name = tc.get("function", {}).get("name", "")
-            func_args = tc.get("function", {}).get("arguments", "{}")
-            if not isinstance(func_args, str):
-                func_args = json.dumps(func_args, ensure_ascii=False)
-            invokes.append(INVOKE_TMPL.format(dsml=DSML, name=func_name, args=func_args))
-        tool_calls_block = ""
-        if invokes:
-            tool_calls_block = DSML_TMPL.format(dsml=DSML, block=TC_BLOCK, invokes="\n".join(invokes))
-        reasoning_block = f"{THINK_START}\n{reasoning}\n{THINK_END}" if reasoning else ""
-        return ASST_TMPL.format(reasoning=reasoning_block, content=content, tool_calls=tool_calls_block)
-    elif role == "tool":
-        return f"<tool_response>{content}</tool_response>"
-    return ""
-def encode_messages(messages: list) -> str:
-    return BOS + "".join(encode_message(m) for m in messages)
 SHELL_PID = None
 SHELL_FD = None
 def _start_shell():
@@ -151,7 +112,6 @@ def handle_meta_compress(messages, args):
     messages[-2]["content"] = "[已压缩] 原始 terminal 输出已被模型压缩"
     return args["summary"]
 
-# ---------- 健康检查 ----------
 def health_check():
     print("正在进行健康检查...")
     if not DEEPSEEK_API_KEY:
@@ -279,12 +239,6 @@ def stream_chat(messages: list):
                 except Exception:
                     pass
         print()
-        # for tc in assistant_msg["tool_calls"]:
-        #     if isinstance(tc["function"]["arguments"],str):
-        #         try:
-        #             tc["function"]["arguments"]=json.loads(tc["function"]["arguments"])
-        #         except:
-        #             pass
         return assistant_msg
     except KeyboardInterrupt:
         print("\n[生成已中断]", flush=True)
@@ -296,17 +250,13 @@ def stream_chat(messages: list):
             print(e.read().decode())
         return None
 
-    # except URLError as e:
-    #     print(f"请求失败: {e}")
-    #     return None
-
 if not health_check():
     sys.exit(1)
 
 messages = []
-print(f"DeepSeek-V4 CLI (模型={config.MODEL}, 推理={config.REASONING_EFFORT}) 已启动。")
-print("特殊命令：/save /load /health /parameter_show /config_show /parameter_save /exit")
-print("动态修改配置： :VAR VALUE (如 :DANGEROUS_ALLOW True)")
+print(f"模型={config.MODEL}, 推理={config.REASONING_EFFORT}")
+print("命令：/save /load /health /parameter_show /config_show /parameter_save /exit")
+print("修改配置： :VAR VALUE (如 :DANGEROUS_ALLOW True)")
 print("本地执行：!<命令> (如 !ls -la)")
 
 while True:
@@ -351,18 +301,16 @@ while True:
                 continue
             filename = parts[1]
             import getpass
-            pw = getpass.getpass("请输入解密密码: ")
+            pw = getpass.getpass("请输入密码: ")
             try:
                 with open(filename, 'rb') as f:
                     data = f.read()
                 messages = _decrypt_messages(data, pw)
                 print(f"已加载加密会话 {filename}")
-                # 提示环境变更
                 messages.append({
                     "role": "system",
                     "content": (
                         "注意：当前终端环境已被重新初始化，之前的 shell 进程已退出。"
-                        "如果之前有未完成的终端操作，请使用 `terminal` 工具重新启动必要的程序。"
                     )
                 })
                 if SHELL_PID:
@@ -450,7 +398,6 @@ while True:
         print(f"已设置 {var} = {repr(new_val)}")
         continue
 
-    # 本地命令直通终端
     elif user_input.startswith("!"):
         command = user_input[1:].strip()
         if not command:
@@ -471,7 +418,7 @@ while True:
             }]
         })
         result = execute_terminal(command)
-        print(f"[结果]\n{result[:1000]}")
+        print(f"[结果]\n{result}")
         messages.append({
             "role": "tool",
             "content":result,
@@ -507,24 +454,17 @@ while True:
                 result = handle_meta_compress(messages, args)
             else:
                 result = f"未知工具: {name}"
-            print(f"[工具结果]\n{result[:1000]}")
-            # messages.append({
-            #     "role": "user",
-            #     "content":f"<tool_result>{result}</tool_result>" ,
-            # })
+            print(f"[工具结果]\n{result}")
             messages.append({
                 "role": "tool",
                 "content":result,
                 "tool_call_id":tc.get("id","")
             })
 
-        # 让模型继续生成
         resp = stream_chat(messages)
         if resp is None:
             print("\n[模型中断或出错]")
             break
-        # assistant_msg = {"role": "assistant", "content": resp.get("content") or None}
-        # assistant_msg = {"role": "assistant", "content": resp.get("content") or ""}
         assistant_msg = {"role": "assistant", "content": resp.get("content") or "", "reasoning_content":""}
         if resp.get("tool_calls"):
             assistant_msg["tool_calls"] = resp["tool_calls"]
