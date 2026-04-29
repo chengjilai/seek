@@ -15,7 +15,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "terminal",
-            "description": "Run a command in a single persistent shell session. The session survives across all calls: working directory, environment variables, and subprocesses (Python REPL, ssh, etc.) all persist. CRITICAL: the prompt character at the end of the output tells you what interpreter is listening. Common prompts: $ (bash/sh), >>> (Python REPL), # (root), ... (continuation). Always check this prompt before your next command — sending a bash command into Python's >>> will fail. If the prompt is missing or output ends with '(timed out)', send an empty command to continue draining output, or send ^C to interrupt the running process and get back to a prompt. There is no need to 'exit' a subprocess unless you need to; staying in Python or another REPL across multiple calls is fine as long as you send matching commands.",
+            "description": "run a command in a persistent shell session. The session survives across calls: working directory, environment variables, and subprocesses (Python REPL, ssh, etc.) all persist. If the prompt is missing or output ends with '(timed out)', send an empty command to continue draining output, or send ^C to interrupt the running process and get back to a prompt. no need to 'exit' a subprocess unless you need to; staying in Python or another REPL across multiple calls is fine if you send matching commands.",
             "parameters": {
                 "type": "object",
                 "properties": {
