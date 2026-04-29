@@ -34,6 +34,7 @@ def _start_shell():
         attrs[3] = attrs[3] & ~termios.ECHO
         termios.tcsetattr(0, termios.TCSANOW, attrs)
         os.environ["PS1"] = "\\$ "
+        os.environ["PS2"] = ""
         os.environ["TERM"] = "dumb"
         os.execvp("bash", ["bash","--norc"])
     else:
@@ -249,6 +250,12 @@ print("/save /load /health /parameter_show /config_show /parameter_save /exit")
 print(":parameter value")
 print("!command")
 messages = []
+messages.append({
+    "role": "system",
+    "content": (
+        f"check these files when needed\n{config.SKILLS}"
+    )
+})
 while True:
     user_input = input("\n> ").strip()
     if not user_input:
