@@ -17,6 +17,7 @@ PROMPT_PATTERNS = [
     rb"^\$ ", rb"^# ", rb">>> ", rb"\.\.\. ",
     rb"\[y/N\]", rb"\[Y/n\]", rb"\(yes/no\)",
     rb"[Pp]assword:", rb"[Pp]assword for ",
+    rb"^> ",rb"\[y/N/e\]"
 ]
 def _sanitize(obj):
     if isinstance(obj, dict):
@@ -95,7 +96,7 @@ def execute_terminal(command: str) -> str:
         return raw.decode("utf-8", errors="replace").strip()
     if not config.DANGEROUS_ALLOW:
         print(f"\n{command}")
-        choice = input("[e: edit, y: execute, n: deny] ").strip().lower()
+        choice = input("[y/N/e] ").strip().lower()
         if choice=='y':
             pass
         elif choice == 'e':
