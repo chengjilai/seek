@@ -7,7 +7,9 @@ PRESENCE_PENALTY = 0.0
 MAX_TOKENS = 8192
 STREAM = True
 DANGEROUS_ALLOW = False
-SKILLS = {"seek.md": "how to work on this project"}
+SKILLS = {
+    # "seek.md": "how to work on this project"
+}
 TOOLS = [
     {
         "type": "function",
