@@ -36,6 +36,7 @@ def _start_shell():
         os.environ["PS1"] = "\\$ "
         os.environ["PS2"] = ""
         os.environ["TERM"] = "dumb"
+        os.environ["PAGER"] = "cat"
         os.execvp("bash", ["bash","--norc"])
     else:
         SHELL_PID = pid
