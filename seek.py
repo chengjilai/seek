@@ -1,6 +1,6 @@
 import os
+import termios
 import hmac
-import sys
 import json
 import time
 import ast
@@ -14,7 +14,7 @@ from urllib.error import URLError
 import config
 DEEPSEEK_API_KEY=os.getenv("DEEPSEEK_API_KEY")
 PROMPT_PATTERNS = [
-    rb"\$ ", rb"# ", rb">>> ", rb"\.\.\. ",
+    rb"^\$ ", rb"^# ", rb">>> ", rb"\.\.\. ",
     rb"\[y/N\]", rb"\[Y/n\]", rb"\(yes/no\)",
     rb"[Pp]assword:", rb"[Pp]assword for ",
 ]
@@ -23,8 +23,6 @@ def _sanitize(obj):
         return {k: _sanitize(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [_sanitize(v) for v in obj]
-    elif obj is None:
-        return None
     return obj
 SHELL_PID = None
 SHELL_FD = None
@@ -32,14 +30,16 @@ def _start_shell():
     global SHELL_PID, SHELL_FD
     pid, fd = pty.fork()
     if pid == 0:
+        attrs = termios.tcgetattr(0)
+        attrs[3] = attrs[3] & ~termios.ECHO
+        termios.tcsetattr(0, termios.TCSANOW, attrs)
         os.environ["PS1"] = "\\$ "
         os.environ["TERM"] = "dumb"
-        os.execvp("bash", ["bash"])
+        os.execvp("bash", ["bash","--norc"])
     else:
         SHELL_PID = pid
         SHELL_FD = fd
         return _expect(PROMPT_PATTERNS, timeout=2) or b"session started"
-
 def _proc_terminated():
     try:
         pid, status = os.waitpid(SHELL_PID, os.WNOHANG)
@@ -48,6 +48,7 @@ def _proc_terminated():
         return True
 
 def _expect(patterns, timeout=30):
+    global SHELL_FD, SHELL_PID
     fd = SHELL_FD
     output = b""
     pattern_re = b"|".join(b"(?:" + p + b")" for p in patterns)
@@ -56,68 +57,70 @@ def _expect(patterns, timeout=30):
         ready, _, _ = select.select([fd], [], [], 0.1)
         if ready:
             try:
-                data = os.read(fd, 4096)
+                data = os.read(fd, 65536)
             except OSError:
                 break
             if not data:
                 break
             output += data
             if re.search(pattern_re, output, re.MULTILINE):
+                drain_deadline = time.time() + 0.1
+                while time.time() < drain_deadline:
+                    r, _, _ = select.select([fd], [], [], 0.05)
+                    if not r:
+                        break
+                    try:
+                        extra = os.read(fd, 65536)
+                    except OSError:
+                        break
+                    if not extra:
+                        break
+                    output += extra
                 return output
         if deadline and time.time() > deadline:
             return output + b"\n(timed out)"
     return output
-
 def execute_terminal(command: str) -> str:
     global SHELL_FD, SHELL_PID
     if not SHELL_FD or SHELL_PID is None or _proc_terminated():
         _start_shell()
-
     if command.strip() == "^C":
         os.write(SHELL_FD, b"\x03")
         raw = _expect(PROMPT_PATTERNS, timeout=5)
         return raw.decode("utf-8", errors="replace").strip()
-
     if command.strip() in ("",):
         raw = _expect(PROMPT_PATTERNS, timeout=30)
         return raw.decode("utf-8", errors="replace").strip()
-
     if not config.DANGEROUS_ALLOW:
-        print(f"\n[终端命令] {command}")
-        choice = input("发送？(y=执行 / e=重写 / N=取消): ").strip().lower()
-        if choice == 'y':
+        print(f"\n{command}")
+        choice = input("[e: edit, y: execute, n: deny] ").strip().lower()
+        if choice=='y':
             pass
         elif choice == 'e':
-            command = input("请输入要执行的命令: ")
-            print(f"执行重写命令: {command}")
+            command = input("command:\n")
         else:
-            return "用户取消"
+            return "user denied"
     else:
-        print(f"\n[自动执行] {command}")
-
+        print(f"\n{command}")
     os.write(SHELL_FD, (command + "\n").encode())
     raw = _expect(PROMPT_PATTERNS, timeout=30)
     return raw.decode("utf-8", errors="replace").strip()
-
 def handle_meta_compress(messages, args):
     if len(messages) < 3:
-        return "错误：没有可压缩的 terminal 输出"
+        return "no terminal output can be compressed"
     prev = messages[-3]
     if prev.get("role") != "assistant" or "tool_calls" not in prev:
-        return "错误：前一次is not tool call"
+        return "last message is not tool call"
     if len(prev["tool_calls"])!=1:
         return "last call used more than one tools, can not compress"
     if prev["tool_calls"][0]["function"]["name"]!="terminal":
         return "last tool call is not terminal"
-    messages[-2]["content"] = "[已压缩] 原始 terminal 输出已被模型压缩"
+    messages[-2]["content"] = "[original output is compressed]"
     return args["summary"]
-
-def health_check():
-    print("正在进行健康检查...")
+def health():
     if not DEEPSEEK_API_KEY:
-        print("❌ 错误：未设置环境变量 DEEPSEEK_API_KEY")
-        return False
-
+        print("DEEPSEEK_API_KEY environment variable not found")
+        return
     try:
         req = Request(
             "https://api.deepseek.com/user/balance",
@@ -126,38 +129,29 @@ def health_check():
         with urlopen(req) as resp:
             balance_data = json.loads(resp.read().decode("utf-8"))
         if not balance_data.get("is_available", False):
-            print("❌ 错误：API Key 无效或余额不足，请检查账户状态。")
-            return False
-        print("✅ API Key 有效，余额可用")
+            print("balance not available")
+            return
     except URLError as e:
-        print(f"❌ 错误：无法连接到 DeepSeek API 进行验证 - {e}")
-        return False
+        print(f"failed to connect to deepseek endpoint- {e}")
+        return
     except Exception as e:
-        print(f"❌ 错误：验证 API Key 时发生未知错误 - {e}")
-        return False
-
+        print(f"{e}")
+        return
     if config.SKILLS:
-        print("检查技能文件...")
         all_valid = True
         for path, desc in config.SKILLS.items():
             if not os.path.isfile(path):
-                print(f"  ❌ 文件不存在: {path} (描述: {desc})")
+                print(f"no such file: {path}")
                 all_valid = False
             elif not os.access(path, os.R_OK):
-                print(f"  ❌ 文件无读权限: {path} (描述: {desc})")
+                print(f"no read access to: {path}")
                 all_valid = False
-            else:
-                print(f"  ✅ 可读: {path} - {desc}")
         if not all_valid:
-            print("❌ 部分技能文件存在问题，请检查上述错误。")
-            return False
-    print("✅ 健康检查通过。")
-    return True
+            return
+    return
 
-# ---------- 会话加密 ----------
 def _derive_key(password: str, salt: bytes) -> bytes:
     return hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
-
 def _encrypt_messages(messages: list, password: str) -> bytes:
     plain = json.dumps(messages, ensure_ascii=False).encode('utf-8')
     salt = os.urandom(16)
@@ -166,7 +160,6 @@ def _encrypt_messages(messages: list, password: str) -> bytes:
     ciphertext = bytes(a ^ b for a, b in zip(plain, key_stream))
     hmac = hashlib.sha256(key + ciphertext).digest()
     return salt + hmac + ciphertext
-
 def _decrypt_messages(data: bytes, password: str) -> list:
     salt = data[:16]
     hmac_stored = data[16:48]
@@ -250,63 +243,35 @@ def stream_chat(messages: list):
             print(e.read().decode())
         return None
 
-if not health_check():
-    sys.exit(1)
-
+health()
+print(f"MODEL: {config.MODEL}\nREASONING_EFFORT: {config.REASONING_EFFORT}\nFREQUENCY_PENALTY: {config.FREQUENCY_PENALTY}\nMAX_TOKEN: {config.MAX_TOKENS}\nTEMPERATURE: {config.TEMPERATURE}\nTOP_P: {config.TOP_P}\nDANGEROUS_ALLOW{config.DANGEROUS_ALLOW}\nSTREAM: {config.STREAM}\nSKILLS: {config.SKILLS}")
+print("/save /load /health /parameter_show /config_show /parameter_save /exit")
+print(":parameter value")
+print("!command")
 messages = []
-print(f"模型={config.MODEL}, 推理={config.REASONING_EFFORT}")
-print("命令：/save /load /health /parameter_show /config_show /parameter_save /exit")
-print("修改配置： :VAR VALUE (如 :DANGEROUS_ALLOW True)")
-print("本地执行：!<命令> (如 !ls -la)")
-
 while True:
-    try:
-        user_input = input("\n> ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n再见！")
-        break
-
+    user_input = input("\n> ").strip()
     if not user_input:
         continue
-
     if user_input.startswith("/"):
-        parts = user_input.split(maxsplit=1)
-        cmd = parts[0].lower()
-
+        parts = user_input.split()
+        cmd = parts[0]
         if cmd == "/exit":
             break
-
         elif cmd == "/save":
-            if len(parts) < 2:
-                print("用法: /save <文件名>")
-                continue
-            filename = parts[1]
             import getpass
             pw = getpass.getpass("请输入加密密码 (至少 8 位): ")
-            if len(pw) < 8:
-                print("密码长度必须至少 8 位")
-                continue
-            try:
-                encrypted = _encrypt_messages(messages, pw)
-                with open(filename, 'wb') as f:
-                    f.write(encrypted)
-                print(f"加密会话已保存到 {filename}")
-            except Exception as e:
-                print(f"保存失败: {e}")
+            encrypted = _encrypt_messages(messages, pw)
+            with open(parts[1], 'wb') as f:
+                f.write(encrypted)
             continue
-
         elif cmd == "/load":
-            if len(parts) < 2:
-                print("用法: /load <文件名>")
-                continue
-            filename = parts[1]
             import getpass
             pw = getpass.getpass("请输入密码: ")
             try:
-                with open(filename, 'rb') as f:
+                with open(parts[1], 'rb') as f:
                     data = f.read()
                 messages = _decrypt_messages(data, pw)
-                print(f"已加载加密会话 {filename}")
                 messages.append({
                     "role": "system",
                     "content": (
@@ -314,95 +279,48 @@ while True:
                     )
                 })
                 if SHELL_PID:
-                    try:
-                        os.kill(SHELL_PID, signal.SIGKILL)
-                        os.waitpid(SHELL_PID, 0)
-                    except:
-                        pass
+                    os.kill(SHELL_PID, signal.SIGKILL)
+                    os.waitpid(SHELL_PID, 0)
                     SHELL_PID = None
                     SHELL_FD = None
-            except FileNotFoundError:
-                print(f"文件不存在: {filename}")
-            except ValueError:
-                print("密码错误或文件已损坏")
             except Exception as e:
                 print(f"加载失败: {e}")
             continue
-
         elif cmd == "/health":
-            health_check()
+            health()
             continue
-
         elif cmd == "/parameter_show":
-            for k, v in vars(config).items():
-                if not k.startswith("_") and not isinstance(v, type(os)):
-                    print(f"  {k} = {repr(v)}")
+            print(f"MODEL: {config.MODEL}\nREASONING_EFFORT: {config.REASONING_EFFORT}\nFREQUENCY_PENALTY: {config.FREQUENCY_PENALTY}\nMAX_TOKEN: {config.MAX_TOKENS}\nTEMPERATURE: {config.TEMPERATURE}\nTOP_P: {config.TOP_P}\nDANGEROUS_ALLOW{config.DANGEROUS_ALLOW}\nSTREAM: {config.STREAM}\nSKILLS: {config.SKILLS}")
             continue
-
         elif cmd == "/config_show":
-            cfg_path = getattr(config, "__file__", None)
-            if not cfg_path:
-                print("无法找到 config.py 路径")
-            else:
-                try:
-                    with open(cfg_path, "r") as f:
-                        print(f.read())
-                except Exception as e:
-                    print(f"读取失败: {e}")
+            cfg_path = getattr(config, "__file__")
+            with open(cfg_path, "r") as f:
+                print(f.read())
             continue
-
         elif cmd == "/parameter_save":
-            cfg_path = getattr(config, "__file__", None)
-            if not cfg_path:
-                print("无法找到 config.py 路径")
-                continue
-            print("警告：将用当前内存值覆盖 config.py，所有注释将丢失。")
-            confirm = input("确认？(y/N): ").strip().lower()
+            cfg_path = getattr(config, "__file__")
+            confirm = input("(y/N): ").strip().lower()
             if confirm != "y":
-                print("已取消")
                 continue
-            try:
-                lines = [""]
-                for k, v in vars(config).items():
-                    if k.startswith("_") or isinstance(v, type(os)):
-                        continue
-                    lines.append(f"{k} = {repr(v)}\n")
-                with open(cfg_path, "w") as f:
-                    f.writelines(lines)
+            lines = [""]
+            for k, v in vars(config).items():
+                if k.startswith("_") or isinstance(v, type(os)):
+                    continue
+                lines.append(f"{k} = {repr(v)}\n")
+            with open(cfg_path, "w") as f:
+                f.writelines(lines)
                 print("配置已保存到", cfg_path)
-            except Exception as e:
-                print(f"保存失败: {e}")
             continue
-
-
         else:
-            print("未知命令。可用: /save /load /health /parameter_show /config_show /parameter_save /exit")
             continue
-
-    # 动态配置修改命令
     elif user_input.startswith(":"):
-        parts = user_input[1:].strip().split(maxsplit=1)
-        if len(parts) != 2:
-            print("用法：: <变量名> <值>")
-            continue
+        parts = user_input[1:].strip().split()
         var, val_str = parts[0].strip(), parts[1].strip()
-        if not hasattr(config, var):
-            print(f"未知变量：{var}")
-            continue
-        try:
-            new_val = ast.literal_eval(val_str)
-        except (ValueError, SyntaxError):
-            print("值格式错误，请输入合法的 Python 字面量")
-            continue
+        new_val = ast.literal_eval(val_str)
         setattr(config, var, new_val)
-        print(f"已设置 {var} = {repr(new_val)}")
         continue
-
     elif user_input.startswith("!"):
         command = user_input[1:].strip()
-        if not command:
-            print("用法：! <命令>")
-            continue
         fake_id = f"user_direct_{int(time.time())}"
         messages.append({
             "role": "assistant",
@@ -418,30 +336,20 @@ while True:
             }]
         })
         result = execute_terminal(command)
-        print(f"[结果]\n{result}")
+        print(f"\n{result}")
         messages.append({
             "role": "tool",
             "content":result,
             "tool_call_id":fake_id
         })
         continue
-
-    # 正常对话
     messages.append({"role": "user", "content": user_input})
     resp = stream_chat(messages)
-    if resp is None:
-        print("最近对话：")
-        for m in messages[-3:]:
-            role = m.get("role", "?")
-            content = m.get("content", "")
-            print(f"  [{role}] {content[:200]}")
-        continue
-    # assistant_msg = {"role": "assistant", "content": resp.get("content") or None}
     assistant_msg = {"role": "assistant", "content": resp.get("content") or "", "reasoning_content":""}
     if resp.get("tool_calls"):
         assistant_msg["tool_calls"] = resp["tool_calls"]
     messages.append(assistant_msg)
-    while resp and resp.get("tool_calls"):
+    while resp.get("tool_calls"):
         for tc in resp["tool_calls"]:
             name = tc["function"]["name"]
             try:
@@ -453,28 +361,19 @@ while True:
             elif name == "meta_compress":
                 result = handle_meta_compress(messages, args)
             else:
-                result = f"未知工具: {name}"
-            print(f"[工具结果]\n{result}")
+                result = f"unknown tool: {name}"
+            print(f"\n{result}")
             messages.append({
                 "role": "tool",
                 "content":result,
                 "tool_call_id":tc.get("id","")
             })
-
         resp = stream_chat(messages)
-        if resp is None:
-            print("\n[模型中断或出错]")
-            break
         assistant_msg = {"role": "assistant", "content": resp.get("content") or "", "reasoning_content":""}
         if resp.get("tool_calls"):
             assistant_msg["tool_calls"] = resp["tool_calls"]
         messages.append(assistant_msg)
 
-
-# 清理子进程
 if SHELL_PID:
-    try:
-        os.kill(SHELL_PID, signal.SIGKILL)
-        os.waitpid(SHELL_PID, 0)
-    except:
-        pass
+    os.kill(SHELL_PID, signal.SIGKILL)
+    os.waitpid(SHELL_PID, 0)
