@@ -13,6 +13,9 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError
 import config
 DEEPSEEK_API_KEY=os.getenv("DEEPSEEK_API_KEY")
+if not DEEPSEEK_API_KEY:
+    print("environment variable DEEPSEEK_API_KEY not set")
+    exit()
 PROMPT_PATTERNS = [
     rb"^\$ ", rb"^# ", rb">>> ", rb"\.\.\. ",
     rb"\[y/N\]", rb"\[Y/n\]", rb"\(yes/no\)",
